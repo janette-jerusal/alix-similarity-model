@@ -228,5 +228,61 @@ st.subheader("Similarity settings")
 
 s1, s2, s3, s4 = st.columns(4)
 with s1:
-    threshold = st.slider("Threshold", 0
+    threshold = st.slider("Threshold", 0.0, 1.0, 0.50, 0.01)
+with s2:
+    top_k_in = st.number_input("Top-K matches per A (0 = all)", min_value=0, max_value=5000, value=20, step=5)
+with s3:
+    ngram_max = st.selectbox("Max n-gram", [1, 2, 3], index=1)
+with s4:
+    max_features_in = st.number_input("Max features (0 = unlimited)", min_value=0, max_value=200000, value=50000, step=5000)
+
+top_k = None if top_k_in == 0 else int(top_k_in)
+max_features = None if max_features_in == 0 else int(max_features_in)
+
+dedupe_symmetric = False
+if self_mode:
+    dedupe_symmetric = st.checkbox("In self-compare, remove mirror duplicates (keep only one of A↔B)", value=True)
+
+# ----------------------------
+# Run
+# ----------------------------
+if st.button("Compare", type="primary"):
+    with st.spinner("Computing similarity..."):
+        results_df = build_results(
+            df_a=df_a,
+            df_b=df_b,
+            a_id_col=a_id_col,
+            a_desc_col=a_desc_col,
+            b_id_col=b_id_col,
+            b_desc_col=b_desc_col,
+            a_keep_cols=a_keep_cols,
+            b_keep_cols=b_keep_cols,
+            threshold=float(threshold),
+            top_k=top_k,
+            ngram_max=int(ngram_max),
+            max_features=max_features,
+            self_mode=self_mode,
+            dedupe_symmetric=dedupe_symmetric,
+        )
+
+    if results_df.empty:
+        st.warning("No matches found at this threshold.")
+        st.stop()
+
+    st.success(f"Found {len(results_df):,} matching pairs.")
+    st.dataframe(results_df, use_container_width=True)
+
+    st.download_button(
+        "Download CSV",
+        data=results_df.to_csv(index=False).encode("utf-8"),
+        file_name="user_story_similarity_results.csv",
+        mime="text/csv",
+    )
+
+    st.download_button(
+        "Download Excel",
+        data=to_excel_bytes(results_df),
+        file_name="user_story_similarity_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
