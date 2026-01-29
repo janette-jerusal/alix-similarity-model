@@ -1,5 +1,6 @@
 # app.py
 # Streamlit app: User Story Similarity with 1-file (self-compare) OR 2-file (A vs B) mode
+# Fixes duplicate column name crashes by making headers unique + deduping selected columns
 # Output includes selectable A_/B_ fields (Topic/Status/Disposition/ID/Description etc.)
 
 import io
@@ -23,13 +24,43 @@ st.caption("Upload one Excel file (self-compare) or two Excel files (cross-compa
 def normalize_colname(x: str) -> str:
     return re.sub(r"\s+", " ", str(x)).strip()
 
+def dedupe_preserve_order(cols):
+    seen = set()
+    out = []
+    for c in cols:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+def make_unique_columns(cols):
+    """
+    Make column names unique by appending .2, .3, ...
+    Streamlit/pyarrow errors if df has duplicate column names.
+    """
+    counts = {}
+    out = []
+    for c in cols:
+        c = str(c)
+        if c not in counts:
+            counts[c] = 1
+            out.append(c)
+        else:
+            counts[c] += 1
+            out.append(f"{c}.{counts[c]}")
+    return out
+
 def read_excel_any(uploaded_file) -> dict:
-    """Return dict of {sheet_name: df} with normalized column names."""
+    """Return dict of {sheet_name: df} with normalized + UNIQUE column names."""
     xls = pd.ExcelFile(uploaded_file)
     out = {}
     for sh in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sh)
-        df.columns = [normalize_colname(c) for c in df.columns]
+
+        # normalize then make unique
+        cols = [normalize_colname(c) for c in df.columns]
+        df.columns = make_unique_columns(cols)
+
         out[sh] = df
     return out
 
@@ -105,10 +136,14 @@ def build_results(
     pairs["A_id"] = df_a.iloc[pairs["_ai"]][a_id_col].astype(str).values
     pairs["B_id"] = df_b.iloc[pairs["_bj"]][b_id_col].astype(str).values
 
-    # Metadata
+    # Metadata (dedup keep cols again just in case)
+    a_keep_cols = dedupe_preserve_order([c for c in a_keep_cols if c in df_a.columns])
+    b_keep_cols = dedupe_preserve_order([c for c in b_keep_cols if c in df_b.columns])
+
     a_meta = df_a[a_keep_cols].copy()
     b_meta = df_b[b_keep_cols].copy()
 
+    # Rename to A_/B_
     a_meta = a_meta.rename(columns={c: ("A_id" if c == a_id_col else f"A_{c}") for c in a_meta.columns})
     b_meta = b_meta.rename(columns={c: ("B_id" if c == b_id_col else f"B_{c}") for c in b_meta.columns})
 
@@ -123,6 +158,10 @@ def build_results(
     ordered = base + sorted(a_cols) + sorted(b_cols)
     ordered = [c for c in ordered if c in out.columns]
     out = out[ordered].sort_values("similarity", ascending=False).reset_index(drop=True)
+
+    # Final safety: make output headers unique for Streamlit/pyarrow
+    out.columns = make_unique_columns(out.columns)
+
     return out
 
 
@@ -208,7 +247,7 @@ with m2:
         default=b_defaults if b_defaults else b_optional,
     )
 
-# Optionally force include descriptions
+# Force include descriptions (recommended)
 force_a_desc = st.checkbox("Force include A description in output", value=True)
 force_b_desc = st.checkbox("Force include B description in output", value=True)
 
@@ -217,9 +256,9 @@ if force_a_desc and a_desc_col not in a_keep:
 if force_b_desc and b_desc_col not in b_keep:
     b_keep = list(dict.fromkeys(b_keep + [b_desc_col]))
 
-# Build keep col lists (always include ID)
-a_keep_cols = [a_id_col] + [c for c in a_keep if c in df_a.columns]
-b_keep_cols = [b_id_col] + [c for c in b_keep if c in df_b.columns]
+# Build keep col lists (always include ID) + dedupe
+a_keep_cols = dedupe_preserve_order([a_id_col] + [c for c in a_keep if c in df_a.columns])
+b_keep_cols = dedupe_preserve_order([b_id_col] + [c for c in b_keep if c in df_b.columns])
 
 # ----------------------------
 # Similarity settings
@@ -228,7 +267,7 @@ st.subheader("Similarity settings")
 
 s1, s2, s3, s4 = st.columns(4)
 with s1:
-    threshold = st.slider("Threshold", 0.0, 1.0, 0.50, 0.01)
+    threshold = st.slider("Minimum similarity score (0–1)", 0.0, 1.0, 0.60, 0.01)
 with s2:
     top_k_in = st.number_input("Top-K matches per A (0 = all)", min_value=0, max_value=5000, value=20, step=5)
 with s3:
