@@ -1,5 +1,6 @@
 # app.py
-# Streamlit app: User Story Similarity with selectable output columns for Story A and Story B
+# Streamlit app: User Story Similarity with 1-file (self-compare) OR 2-file (A vs B) mode
+# Output includes selectable A_/B_ fields (Topic/Status/Disposition/ID/Description etc.)
 
 import io
 import re
@@ -13,7 +14,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 st.set_page_config(page_title="User Story Similarity", layout="wide")
 st.title("User Story Similarity (TF-IDF + Cosine)")
-st.caption("Upload two Excel files, map columns, choose which fields to include in the final output.")
+st.caption("Upload one Excel file (self-compare) or two Excel files (cross-compare). Choose which fields appear in the output.")
 
 
 # ----------------------------
@@ -32,10 +33,11 @@ def read_excel_any(uploaded_file) -> dict:
         out[sh] = df
     return out
 
-def safe_str(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x)
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Results") -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buf.getvalue()
 
 def build_results(
     df_a: pd.DataFrame,
@@ -50,13 +52,13 @@ def build_results(
     top_k: int | None,
     ngram_max: int,
     max_features: int | None,
+    self_mode: bool,
+    dedupe_symmetric: bool,
 ):
     # Text arrays
     a_text = df_a[a_desc_col].fillna("").astype(str).tolist()
     b_text = df_b[b_desc_col].fillna("").astype(str).tolist()
-
-    # If either side empty, return empty
-    if len(a_text) == 0 or len(b_text) == 0:
+    if not a_text or not b_text:
         return pd.DataFrame()
 
     # Fit vectorizer on combined corpus to share vocab
@@ -71,21 +73,25 @@ def build_results(
     Xa = X[: len(a_text)]
     Xb = X[len(a_text) :]
 
-    sims = cosine_similarity(Xa, Xb)  # shape: [len(A), len(B)]
+    sims = cosine_similarity(Xa, Xb)  # [len(A), len(B)]
 
-    # Build pair table efficiently
+    # Build pair list
     rows = []
     for i in range(sims.shape[0]):
         row = sims[i]
+
         if top_k is not None and top_k > 0:
-            # take top_k indices then filter by threshold
-            idx = np.argpartition(-row, min(top_k, len(row)) - 1)[: min(top_k, len(row))]
+            k = min(top_k, len(row))
+            idx = np.argpartition(-row, k - 1)[:k]
             idx = idx[np.argsort(-row[idx])]
         else:
-            # all
             idx = np.arange(len(row))
 
         for j in idx:
+            if self_mode and i == j:
+                continue  # don't match a story to itself
+            if self_mode and dedupe_symmetric and j < i:
+                continue  # avoid mirror duplicates (keep only i < j)
             score = float(row[j])
             if score >= threshold:
                 rows.append((i, j, score))
@@ -95,86 +101,81 @@ def build_results(
 
     pairs = pd.DataFrame(rows, columns=["_ai", "_bj", "similarity"])
 
-    # Pull ids
+    # IDs
     pairs["A_id"] = df_a.iloc[pairs["_ai"]][a_id_col].astype(str).values
     pairs["B_id"] = df_b.iloc[pairs["_bj"]][b_id_col].astype(str).values
 
-    # Attach selected metadata (prefixed)
-    # Always include descriptions in output if selected by user; you control via keep cols lists
-    a_meta = df_a[[a_id_col] + [c for c in a_keep_cols if c != a_id_col]].copy()
-    b_meta = df_b[[b_id_col] + [c for c in b_keep_cols if c != b_id_col]].copy()
+    # Metadata
+    a_meta = df_a[a_keep_cols].copy()
+    b_meta = df_b[b_keep_cols].copy()
 
-    # Rename to A_/B_
     a_meta = a_meta.rename(columns={c: ("A_id" if c == a_id_col else f"A_{c}") for c in a_meta.columns})
     b_meta = b_meta.rename(columns={c: ("B_id" if c == b_id_col else f"B_{c}") for c in b_meta.columns})
 
-    # Merge
+    # Merge metadata onto pairs
     out = pairs.merge(a_meta, on="A_id", how="left").merge(b_meta, on="B_id", how="left")
-
-    # Clean helper cols
     out = out.drop(columns=["_ai", "_bj"])
 
-    # Order columns nicely
+    # Order columns: similarity, A..., B...
     base = ["similarity", "A_id", "B_id"]
     a_cols = [c for c in out.columns if c.startswith("A_")]
     b_cols = [c for c in out.columns if c.startswith("B_")]
     ordered = base + sorted(a_cols) + sorted(b_cols)
     ordered = [c for c in ordered if c in out.columns]
     out = out[ordered].sort_values("similarity", ascending=False).reset_index(drop=True)
-
     return out
 
 
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Results") -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    return buf.getvalue()
-
-
 # ----------------------------
-# UI: Uploads
+# Uploads (File B optional)
 # ----------------------------
 col1, col2 = st.columns(2)
-
 with col1:
-    file_a = st.file_uploader("Upload Excel for Story A", type=["xlsx", "xls"], key="file_a")
+    file_a = st.file_uploader("Upload Excel (Story A) — required", type=["xlsx", "xls"], key="file_a")
 with col2:
-    file_b = st.file_uploader("Upload Excel for Story B", type=["xlsx", "xls"], key="file_b")
+    file_b = st.file_uploader("Upload Excel (Story B) — optional", type=["xlsx", "xls"], key="file_b")
 
-if not file_a or not file_b:
-    st.info("Upload both files to continue.")
+if not file_a:
+    st.info("Upload at least one Excel file to continue.")
     st.stop()
 
 sheets_a = read_excel_any(file_a)
-sheets_b = read_excel_any(file_b)
+sheets_b = read_excel_any(file_b) if file_b else None
+
+# Mode
+self_mode = file_b is None
+st.subheader("Mode")
+st.write("**Self-compare mode** (1 file) ✅" if self_mode else "**Cross-compare mode** (2 files) ✅")
 
 # ----------------------------
-# UI: Sheet selection
+# Sheet selection
 # ----------------------------
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     sheet_a = st.selectbox("Sheet for Story A", list(sheets_a.keys()))
-with col2:
-    sheet_b = st.selectbox("Sheet for Story B", list(sheets_b.keys()))
+
+with c2:
+    if sheets_b:
+        sheet_b = st.selectbox("Sheet for Story B", list(sheets_b.keys()))
+    else:
+        sheet_b = sheet_a  # same sheet
 
 df_a = sheets_a[sheet_a]
-df_b = sheets_b[sheet_b]
+df_b = sheets_b[sheet_b] if sheets_b else df_a.copy()
 
 if df_a.empty or df_b.empty:
     st.warning("One of the selected sheets is empty.")
     st.stop()
 
-cols_a = list(df_a.columns)
-cols_b = list(df_b.columns)
-
 # ----------------------------
-# UI: Column mapping
+# Column mapping
 # ----------------------------
 st.subheader("Column mapping")
 
-m1, m2 = st.columns(2)
+cols_a = list(df_a.columns)
+cols_b = list(df_b.columns)
 
+m1, m2 = st.columns(2)
 with m1:
     st.markdown("**Story A**")
     a_id_col = st.selectbox("A: ID column", cols_a, index=cols_a.index("ID") if "ID" in cols_a else 0)
@@ -207,72 +208,25 @@ with m2:
         default=b_defaults if b_defaults else b_optional,
     )
 
-# Ensure description is present if user wants it; you can force it:
-if a_desc_col not in a_keep and st.checkbox("Force include A description in output", value=True):
+# Optionally force include descriptions
+force_a_desc = st.checkbox("Force include A description in output", value=True)
+force_b_desc = st.checkbox("Force include B description in output", value=True)
+
+if force_a_desc and a_desc_col not in a_keep:
     a_keep = list(dict.fromkeys(a_keep + [a_desc_col]))
-if b_desc_col not in b_keep and st.checkbox("Force include B description in output", value=True):
+if force_b_desc and b_desc_col not in b_keep:
     b_keep = list(dict.fromkeys(b_keep + [b_desc_col]))
 
+# Build keep col lists (always include ID)
+a_keep_cols = [a_id_col] + [c for c in a_keep if c in df_a.columns]
+b_keep_cols = [b_id_col] + [c for c in b_keep if c in df_b.columns]
+
 # ----------------------------
-# UI: Similarity controls
+# Similarity settings
 # ----------------------------
 st.subheader("Similarity settings")
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    threshold = st.slider("Threshold", 0.0, 1.0, 0.50, 0.01)
-with c2:
-    top_k = st.number_input("Top-K matches per A (0 = all)", min_value=0, max_value=5000, value=20, step=5)
-with c3:
-    ngram_max = st.selectbox("Max n-gram", [1, 2, 3], index=1)  # default 2
-with c4:
-    max_features = st.number_input("Max features (0 = unlimited)", min_value=0, max_value=200000, value=50000, step=5000)
+s1, s2, s3, s4 = st.columns(4)
+with s1:
+    threshold = st.slider("Threshold", 0
 
-top_k_val = None if top_k == 0 else int(top_k)
-max_features_val = None if max_features == 0 else int(max_features)
-
-# ----------------------------
-# Run
-# ----------------------------
-if st.button("Compare", type="primary"):
-    with st.spinner("Computing similarity..."):
-        # always include ID in keep list
-        a_keep_cols = [a_id_col] + [c for c in a_keep if c in df_a.columns]
-        b_keep_cols = [b_id_col] + [c for c in b_keep if c in df_b.columns]
-
-        results_df = build_results(
-            df_a=df_a,
-            df_b=df_b,
-            a_id_col=a_id_col,
-            a_desc_col=a_desc_col,
-            b_id_col=b_id_col,
-            b_desc_col=b_desc_col,
-            a_keep_cols=a_keep_cols,
-            b_keep_cols=b_keep_cols,
-            threshold=float(threshold),
-            top_k=top_k_val,
-            ngram_max=int(ngram_max),
-            max_features=max_features_val,
-        )
-
-    if results_df.empty:
-        st.warning("No matches found at this threshold.")
-        st.stop()
-
-    st.success(f"Found {len(results_df):,} matching pairs.")
-    st.dataframe(results_df, use_container_width=True)
-
-    # Downloads
-    st.download_button(
-        "Download CSV",
-        data=results_df.to_csv(index=False).encode("utf-8"),
-        file_name="user_story_similarity_results.csv",
-        mime="text/csv",
-    )
-
-    st.download_button(
-        "Download Excel",
-        data=to_excel_bytes(results_df),
-        file_name="user_story_similarity_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
